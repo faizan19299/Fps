@@ -1,0 +1,486 @@
+name: Build FPS Locker mod
+
+# How to use: save this whole file as .github/workflows/build.yml in your GitHub repo.
+# GitHub then builds the mod by itself. The finished .jar appears under "Releases"
+# (and also under the run's "Artifacts"). Run it again any time from the Actions tab.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the mod files
+        run: |
+          set -e
+          mkdir -p mod/src/main/java/com/fpslocker mod/src/main/resources
+          cd mod
+          cat > settings.gradle <<'FPSLOCKER_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = "Fabric"
+                      url = "https://maven.fabricmc.net/"
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = "fpslocker"
+          FPSLOCKER_EOF
+          cat > gradle.properties <<'FPSLOCKER_EOF'
+          org.gradle.jvmargs=-Xmx2G -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          minecraft_version=26.2
+          loader_version=0.19.3
+          loom_version=1.17.20
+          fabric_api_version=0.154.2+26.2
+          modmenu_version=20.0.1
+
+          mod_version=1.0.0
+          maven_group=com.fpslocker
+          archives_base_name=fpslocker
+          FPSLOCKER_EOF
+          cat > build.gradle <<'FPSLOCKER_EOF'
+          plugins {
+              id "net.fabricmc.fabric-loom" version "${loom_version}"
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              maven {
+                  name = "Fabric"
+                  url = "https://maven.fabricmc.net/"
+              }
+              maven {
+                  name = "TerraformersMC"
+                  url = "https://maven.terraformersmc.com/releases/"
+              }
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+              // Mod Menu is only needed to compile the settings entry; players install it separately.
+              compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 25
+              options.encoding = "UTF-8"
+          }
+          FPSLOCKER_EOF
+          cat > src/main/resources/fabric.mod.json <<'FPSLOCKER_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "fpslocker",
+            "version": "1.0.0",
+            "name": "FPS Locker",
+            "description": "Locks your FPS to steady steps of 10 (30, 40, 50 ...), never above your Max FPS, and lowers quality only when FPS falls under your minimum.",
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": [
+                "com.fpslocker.FpsLockerClient"
+              ],
+              "modmenu": [
+                "com.fpslocker.FpsLockerModMenu"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.3",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            },
+            "suggests": {
+              "modmenu": "*"
+            }
+          }
+          FPSLOCKER_EOF
+          cat > src/main/java/com/fpslocker/FpsGovernor.java <<'FPSLOCKER_EOF'
+          package com.fpslocker;
+
+          /**
+           * The brain of FPS Locker. It has no Minecraft code in it, so it can be tested on its own.
+           *
+           * Call onSample() once per second with the FPS the game reported. Afterwards read:
+           *   cap   - the frame limit to apply (a multiple of 10; 260 = unlimited, used only while measuring)
+           *   level - the quality saver level to apply (0 = player's own settings)
+           *
+           * How it works:
+           *  1. It measures what the device can really do by lifting the limit for a few seconds.
+           *  2. It then locks the limit to the highest multiple of 10 the device can hold (never above Max FPS),
+           *     so FPS is steady (30 / 40 / 50 ...) instead of bouncing (31, 37, 34 ...).
+           *  3. If FPS is below the minimum, the quality saver lowers the load step by step.
+           *     Quality only comes back when a test shows it costs no FPS.
+           */
+          final class FpsGovernor {
+              static final int UNLIMITED = 260;
+              static final int MIN_CAP = 10;
+
+              // ---- tuning (all in seconds or FPS) ----
+              static final int TOL = 2;                    // FPS counted as "holding the limit": limit - 2
+              static final int LOW_AFTER = 4;              // seconds below the limit before we re-measure
+              static final int LOW_GAP = 20;               // minimum seconds between two "low" measurements
+              static final int MEASURE_SKIP = 1;           // first second after lifting the limit is mixed, ignore it
+              static final int MEASURE_USE = 3;            // seconds that are averaged
+              static final int PROBE_BASE = 20;            // seconds before checking if the device can do more
+              static final int PROBE_MAX = 240;
+              static final int SAVER_AFTER = 5;            // seconds below minimum before quality is lowered
+              static final int SAVER_AFTER_EMERGENCY = 3;
+              static final int EMERGENCY_FPS = 25;         // below this the saver moves two steps at once
+              static final int SAVER_COOLDOWN = 8;
+              static final int SAVER_COOLDOWN_EMERGENCY = 4;
+              static final int RESTORE_AFTER = 45;         // seconds of steady FPS before trying to bring quality back
+              static final int RESTORE_GAP = 30;
+              static final int RESTORE_BACKOFF_BASE = 90;
+              static final int RESTORE_BACKOFF_MAX = 900;
+
+              // ---- settings, copied in by the caller before each sample ----
+              int maxFps = 60;
+              int minFps = 40;
+              boolean saverOn = true;
+              int maxLevel = 4;
+
+              // ---- results ----
+              int cap = 60;
+              int level = 0;
+              boolean measuring = false;
+
+              // ---- internals ----
+              private int capBeforeMeasure = 60;
+              private int measureAge;
+              private int measureN;
+              private int measureSum;
+              private int lowStreak;
+              private int heldStreak;
+              private int sinceMeasure = 1000;
+              private int probeDelay = PROBE_BASE;
+              private int belowMinStreak;
+              private int sinceLevelChange = 1000;
+              private int restoreBlocked;
+              private int restoreBackoff = RESTORE_BACKOFF_BASE;
+              private boolean restoreCheck;
+              private boolean restoreTrial;
+              private int restoreCapBefore;
+              private int lastMaxFps = -1;
+              private boolean wantMeasure;
+
+              /** Forget everything (used when the mod is switched off and on again). */
+              void reset() {
+                  normalize();
+                  measuring = false;
+                  restoreCheck = false;
+                  restoreTrial = false;
+                  cap = maxFps;
+                  level = 0;
+                  lowStreak = 0;
+                  heldStreak = 0;
+                  belowMinStreak = 0;
+                  sinceMeasure = 1000;
+                  sinceLevelChange = 1000;
+                  probeDelay = PROBE_BASE;
+                  restoreBlocked = 0;
+                  restoreBackoff = RESTORE_BACKOFF_BASE;
+                  wantMeasure = false;
+              }
+
+              /** New world / dimension: keep what was learned, drop anything half-finished. */
+              void softReset() {
+                  restoreCheck = false;
+                  if (restoreTrial) {
+                      restoreTrial = false;
+                      level = Math.min(maxLevel, level + 1);
+                  }
+                  if (measuring) {
+                      measuring = false;
+                      cap = capBeforeMeasure;
+                  }
+                  lowStreak = 0;
+                  heldStreak = 0;
+                  belowMinStreak = 0;
+              }
+
+              /** The player changed the quality by hand: forget our own steps. */
+              void forgetLevel() {
+                  level = 0;
+                  restoreCheck = false;
+                  restoreTrial = false;
+                  belowMinStreak = 0;
+                  sinceLevelChange = 0;
+              }
+
+              void onSample(int fps) {
+                  normalize();
+                  if (sinceMeasure < 100000) sinceMeasure++;
+                  if (sinceLevelChange < 100000) sinceLevelChange++;
+                  if (restoreBlocked > 0) restoreBlocked--;
+
+                  if (wantMeasure && !measuring) {
+                      wantMeasure = false;
+                      startMeasure();
+                  }
+
+                  // ---- measuring: the limit is lifted, so fps is what the device can really do ----
+                  if (measuring) {
+                      measureAge++;
+                      if (measureAge > MEASURE_SKIP) {
+                          measureSum += fps;
+                          measureN++;
+                      }
+                      saverStep(fps);
+                      if (measuring && measureN >= MEASURE_USE) finishMeasure();
+                      return;
+                  }
+
+                  // ---- steady: the limit is locked ----
+                  boolean held = fps >= cap - TOL;
+                  if (held) {
+                      heldStreak++;
+                      lowStreak = 0;
+                  } else {
+                      lowStreak++;
+                      heldStreak = 0;
+                  }
+
+                  saverStep(fps);
+                  if (measuring) return;
+
+                  if (lowStreak >= LOW_AFTER && sinceMeasure >= LOW_GAP) {
+                      startMeasure();
+                      return;
+                  }
+                  if (cap < maxFps && heldStreak >= probeDelay && sinceMeasure >= probeDelay) {
+                      startMeasure();
+                      return;
+                  }
+
+                  // Quality comes back only when there is clearly spare power AND a test shows it does not cost FPS.
+                  if (saverOn && level > 0 && !restoreTrial && !restoreCheck && belowMinStreak == 0
+                          && heldStreak >= RESTORE_AFTER && restoreBlocked == 0 && sinceLevelChange >= RESTORE_GAP) {
+                      restoreCheck = true;
+                      startMeasure();
+                  }
+              }
+
+              private void saverStep(int fps) {
+                  if (!saverOn || maxLevel <= 0) return;
+                  int effMin = Math.min(minFps, maxFps);
+                  boolean low = fps < effMin - TOL;
+                  if (low) belowMinStreak++;
+                  else belowMinStreak = 0;
+
+                  boolean emergency = low && fps < EMERGENCY_FPS;
+                  int need = emergency ? SAVER_AFTER_EMERGENCY : SAVER_AFTER;
+                  int cooldown = emergency ? SAVER_COOLDOWN_EMERGENCY : SAVER_COOLDOWN;
+
+                  if (!restoreTrial && !restoreCheck && level < maxLevel && belowMinStreak >= need && sinceLevelChange >= cooldown) {
+                      level = Math.min(maxLevel, level + (emergency ? 2 : 1));
+                      levelChanged();
+                  }
+              }
+
+              /** Quality changed, so the device can do a different amount now: measure again. */
+              private void levelChanged() {
+                  sinceLevelChange = 0;
+                  belowMinStreak = 0;
+                  startMeasure();
+              }
+
+              private void startMeasure() {
+                  if (!measuring) {
+                      measuring = true;
+                      capBeforeMeasure = cap;
+                      cap = UNLIMITED;
+                  }
+                  measureAge = 0;
+                  measureN = 0;
+                  measureSum = 0;
+                  lowStreak = 0;
+                  heldStreak = 0;
+              }
+
+              private void finishMeasure() {
+                  int capability = measureSum / measureN;
+                  int newCap = clamp(floor10(capability + 1), MIN_CAP, maxFps);
+                  measuring = false;
+                  sinceMeasure = 0;
+                  lowStreak = 0;
+                  heldStreak = 0;
+
+                  if (restoreCheck) {
+                      restoreCheck = false;
+                      if (level > 0 && capability >= capBeforeMeasure * 5 / 4 + 2) {
+                          // Lots of spare power: bring one step of quality back and measure again to be sure.
+                          restoreTrial = true;
+                          restoreCapBefore = capBeforeMeasure;
+                          cap = capBeforeMeasure;
+                          level--;
+                          levelChanged();
+                          return;
+                      }
+                      restoreBlocked = restoreBackoff;
+                      restoreBackoff = Math.min(RESTORE_BACKOFF_MAX, restoreBackoff * 2);
+                  }
+
+                  if (restoreTrial) {
+                      restoreTrial = false;
+                      if (newCap < restoreCapBefore) {
+                          // Better quality would cost FPS: undo it and wait before trying again.
+                          level = Math.min(maxLevel, level + 1);
+                          sinceLevelChange = 0;
+                          restoreBlocked = restoreBackoff;
+                          restoreBackoff = Math.min(RESTORE_BACKOFF_MAX, restoreBackoff * 2);
+                          cap = restoreCapBefore;
+                          return;
+                      }
+                      restoreBackoff = RESTORE_BACKOFF_BASE;
+                  }
+
+                  if (newCap == capBeforeMeasure) probeDelay = Math.min(PROBE_MAX, probeDelay * 2);
+                  else probeDelay = Math.max(PROBE_BASE, probeDelay / 2);
+                  cap = newCap;
+              }
+
+              private void normalize() {
+                  maxFps = clamp(Math.round(maxFps / 10f) * 10, MIN_CAP, UNLIMITED);
+                  minFps = clamp(minFps, 10, 240);
+                  maxLevel = clamp(maxLevel, 0, 6);
+
+                  if (lastMaxFps != -1 && maxFps > lastMaxFps) wantMeasure = true; // more room: see how much the device can do
+                  lastMaxFps = maxFps;
+
+                  if (measuring) capBeforeMeasure = Math.min(capBeforeMeasure, maxFps);
+                  else cap = clamp(cap, MIN_CAP, maxFps);
+
+                  int allowed = saverOn ? maxLevel : 0;
+                  if (level > allowed) {
+                      level = allowed;
+                      restoreTrial = false;
+                      sinceLevelChange = 0;
+                      belowMinStreak = 0;
+                  }
+              }
+
+              static int floor10(int v) {
+                  return (Math.max(0, v) / 10) * 10;
+              }
+
+              static int clamp(int v, int lo, int hi) {
+                  return Math.max(lo, Math.min(hi, v));
+              }
+          }
+          FPSLOCKER_EOF
+          cat > src/main/java/com/fpslocker/FpsLockerConfig.java <<'FPSLOCKER_EOF'
+          package com.fpslocker;
+
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+
+          /** Settings, stored in config/fpslocker.properties. */
+          public final class FpsLockerConfig {
+              public static boolean enabled = true;
+              public static int maxFps = 60;            // the ceiling, a multiple of 10 (260 = unlimited)
+              public static int minFps = 40;            // the quality saver tries to keep FPS at or above this
+              public static boolean saverEnabled = true;
+              public static int saverLevels = 4;        // how many steps the quality saver may take (0-6)
+              public static int minRenderDistance = 6;  // the saver never goes below this
+
+              // Crash safety: the player's own options from before the saver lowered them (-1 = nothing to restore).
+              static int recoverRdBase = -1;
+              static int recoverRdApplied = -1;
+              static double recoverEsBase = -1;
+              static double recoverEsApplied = -1;
+
+              private FpsLockerConfig() {
+              }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("fpslocker.properties");
+              }
+
+              public static int clamp(int v, int lo, int hi) {
+                  return Math.max(lo, Math.min(hi, v));
+              }
+
+              public static int clampMaxFps(int v) {
+                  return clamp(Math.round(v / 10f) * 10, 10, 260);
+              }
+
+              public static int clampMinFps(int v) {
+                  return clamp(Math.round(v / 5f) * 5, 10, 240);
+              }
+
+              public static void resetToDefaults() {
+                  enabled = true;
+                  maxFps = 60;
+                  minFps = 40;
+                  saverEnabled = true;
+                  saverLevels = 4;
+                  minRenderDistance = 6;
+                  save();
+              }
+
+              public static void load() {
+                  Path f = file();
+                  if (!Files.exists(f)) {
+                      save();
+                      return;
+                  }
+                  Properties p = new Properties();
+                  try (Reader r = Files.newBufferedReader(f)) {
+                      p.load(r);
+                  } catch (IOException e) {
+                      FpsLockerClient.LOGGER.warn("FPS Locker could not read its settings file: {}", e.toString());
+                      return;
+                  }
+                  enabled = bool(p, "enabled", true);
+                  maxFps = clampMaxFps(num(p, "maxFps", 60));
+                  minFps = clampMinFps(num(p, "minFps", 40));
+                  saverEnabled = bool(p, "saverEnabled", true);
+                  saverLevels = clamp(num(p, "saverLevels", 4), 0, 6);
+                  minRenderDistance = clamp(num(p, "minRenderDistance", 6), 2, 16);
+                  recoverRdBase = num(p, "recover.rd.base", -1);
+                  recoverRdApplied = num(p, "recover.rd.applied", -1);
+                  recoverEsBase = dbl(p, "recover.es.base", -1);
+                  recoverEsApplied = dbl(p, "recover.es.applied", -1);
+              }
+
+              public static void save() {
+                  Properties p = new Properties();
+                  p.setProperty("enabled", Boolean.toString(enabled));
+                  p.setProperty("maxFps", Integer.toString(maxFps));
+                  p.setProperty("minFps", Integer.toString(minFps));
+                  p.setProperty("saverEnabled", Boolean.toString(saverEnabled));
+                  p.setProperty("saverLevels", Integer.toS
